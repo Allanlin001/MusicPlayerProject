@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rhythm Game</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #111;
+    color: #fff;
+    font-family: monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    gap: 12px;
+  }
+  #ui {
+    display: flex;
+    gap: 32px;
+    font-size: 14px;
+    color: #aaa;
+  }
+  #ui span { color: #fff; font-size: 18px; font-weight: bold; }
+  canvas {
+    border: 1px solid #333;
+    display: block;
+  }
+  #feedback {
+    font-size: 22px;
+    font-weight: bold;
+    height: 30px;
+    letter-spacing: 2px;
+  }
+  #keys {
+    display: flex;
+    gap: 8px;
+    font-size: 12px;
+    color: #555;
+  }
+  .key-label {
+    width: 60px;
+    text-align: center;
+  }
+  button {
+    margin-top: 8px;
+    padding: 10px 32px;
+    background: transparent;
+    border: 1px solid #555;
+    color: #fff;
+    font-size: 15px;
+    cursor: pointer;
+    letter-spacing: 1px;
+  }
+  button:hover { border-color: #fff; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div>SCORE <span id="scoreDisplay">0</span></div>
+  <div>COMBO <span id="comboDisplay">0</span></div>
+</div>
+
+<canvas id="gameCanvas" width="300" height="500"></canvas>
+
+<div id="feedback"></div>
+
+<div id="keys">
+  <div class="key-label">D</div>
+  <div class="key-label">F</div>
+  <div class="key-label">J</div>
+  <div class="key-label">K</div>
+</div>
+
+<button id="startBtn">START</button>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const LANES = 4;
+const LANE_WIDTH = canvas.width / LANES;
+const HIT_ZONE_Y = canvas.height - 60;   // y position of the hit bar
+const NOTE_SPEED = 300;                   // pixels per second
+const HIT_WINDOW = 0.15;                 // ±150ms timing window
+
+// Key bindings: D F J K → lanes 0 1 2 3
+const KEY_MAP = { 'd': 0, 'f': 1, 'j': 2, 'k': 3 };
+
+// Lane colors
+const LANE_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12'];
+
+// ─── HARDCODED SONG (timestamps in seconds, lane 0-3) ─────────────────────────
+// Edit these to match your own song's beat!
+// Pattern: alternating lanes, ~0.5s apart (120 BPM feel)
+const SONG_NOTES = [];
+(function buildNotes() {
+  const patterns = [
+    [0, 2], [1, 3], [0, 2], [1, 3],
+    [0, 1], [2, 3], [0, 1], [2, 3],
+    [0], [1], [2], [3], [0], [1], [2], [3],
+    [0, 3], [1, 2], [0, 3], [1, 2],
+  ];
+  let t = 1.0;
+  patterns.forEach(group => {
+    group.forEach(lane => {
+      SONG_NOTES.push({ time: t, lane, hit: false, missed: false });
+    });
+    t += 0.5;
+  });
+})();
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let audioCtx = null;
+let startTime = null;
+let notes = [];
+let score = 0;
+let combo = 0;
+let running = false;
+let animFrameId = null;
+let feedbackTimer = null;
+let laneFlash = [0, 0, 0, 0]; // flash alpha when key pressed
+
+// ─── AUDIO ────────────────────────────────────────────────────────────────────
+// We generate a simple click/beep sound using Web Audio — no mp3 file needed.
+// Swap this out with an AudioBufferSourceNode loaded from your own mp3 later.
+function playClick(freq = 440, dur = 0.05) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.start(audioCtx.currentTime);
+  osc.stop(audioCtx.currentTime + dur);
+}
+
+function currentSongTime() {
+  if (!audioCtx || startTime === null) return 0;
+  return audioCtx.currentTime - startTime;
+}
+
+// ─── START ────────────────────────────────────────────────────────────────────
+document.getElementById('startBtn').addEventListener('click', startGame);
+
+function startGame() {
+  document.getElementById('startBtn').style.display = 'none';
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  startTime = audioCtx.currentTime + 0.1; // tiny buffer
+  notes = SONG_NOTES.map(n => ({ ...n, hit: false, missed: false }));
+  score = 0;
+  combo = 0;
+  running = true;
+  laneFlash = [0, 0, 0, 0];
+  updateUI();
+  loop();
+}
+
+// ─── GAME LOOP ────────────────────────────────────────────────────────────────
+let lastTimestamp = null;
+
+function loop(timestamp) {
+  if (!running) return;
+  const dt = lastTimestamp ? (timestamp - lastTimestamp) / 1000 : 0;
+  lastTimestamp = timestamp;
+  const songTime = currentSongTime();
+
+  // Mark notes as missed if they're too late to hit
+  notes.forEach(n => {
+    if (!n.hit && !n.missed && songTime > n.time + HIT_WINDOW) {
+      n.missed = true;
+      combo = 0;
+      showFeedback('MISS', '#e74c3c');
+      updateUI();
+    }
+  });
+
+  // Decay lane flash
+  laneFlash = laneFlash.map(v => Math.max(0, v - dt * 4));
+
+  draw(songTime);
+  animFrameId = requestAnimationFrame(loop);
+
+  // End game when all notes are done
+  const allDone = notes.every(n => n.hit || n.missed);
+  if (allDone && songTime > (notes[notes.length - 1]?.time ?? 0) + 1) {
+    running = false;
+    drawEndScreen();
+  }
+}
+
+// ─── DRAW ─────────────────────────────────────────────────────────────────────
+function draw(songTime) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Background
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Lane dividers
+  ctx.strokeStyle = '#2a2a2a';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < LANES; i++) {
+    ctx.beginPath();
+    ctx.moveTo(i * LANE_WIDTH, 0);
+    ctx.lineTo(i * LANE_WIDTH, canvas.height);
+    ctx.stroke();
+  }
+
+  // Lane flash on keypress
+  laneFlash.forEach((alpha, i) => {
+    if (alpha > 0) {
+      ctx.fillStyle = `rgba(255,255,255,${alpha * 0.08})`;
+      ctx.fillRect(i * LANE_WIDTH, 0, LANE_WIDTH, canvas.height);
+    }
+  });
+
+  // Hit bar
+  ctx.fillStyle = '#333';
+  ctx.fillRect(0, HIT_ZONE_Y, canvas.width, 3);
+  LANE_COLORS.forEach((color, i) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(i * LANE_WIDTH + 4, HIT_ZONE_Y - 18, LANE_WIDTH - 8, 20);
+  });
+
+  // Notes
+  notes.forEach(note => {
+    if (note.hit || note.missed) return;
+    const elapsed = songTime - note.time;
+    // y=HIT_ZONE_Y when elapsed=0, above when negative (note hasn't arrived yet)
+    const y = HIT_ZONE_Y + elapsed * NOTE_SPEED;
+    if (y < -20 || y > canvas.height + 20) return;
+
+    const x = note.lane * LANE_WIDTH;
+    const color = LANE_COLORS[note.lane];
+
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.roundRect(x + 4, y - 14, LANE_WIDTH - 8, 14, 4);
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.beginPath();
+    ctx.roundRect(x + 4, y - 14, LANE_WIDTH - 8, 5, [4, 4, 0, 0]);
+    ctx.fill();
+  });
+}
+
+function drawEndScreen() {
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 28px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('CLEAR!', canvas.width / 2, canvas.height / 2 - 20);
+  ctx.font = '18px monospace';
+  ctx.fillStyle = '#aaa';
+  ctx.fillText(`SCORE: ${score}`, canvas.width / 2, canvas.height / 2 + 20);
+  document.getElementById('startBtn').textContent = 'RETRY';
+  document.getElementById('startBtn').style.display = 'inline-block';
+}
+
+// ─── HIT DETECTION ────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (!running) return;
+  const key = e.key.toLowerCase();
+  if (!(key in KEY_MAP)) return;
+  const lane = KEY_MAP[key];
+  laneFlash[lane] = 1;
+
+  const songTime = currentSongTime();
+
+  // Find the closest unhit note in this lane within the hit window
+  let best = null;
+  let bestDelta = Infinity;
+
+  notes.forEach(note => {
+    if (note.hit || note.missed || note.lane !== lane) return;
+    const delta = Math.abs(songTime - note.time);
+    if (delta <= HIT_WINDOW && delta < bestDelta) {
+      best = note;
+      bestDelta = delta;
+    }
+  });
+
+  if (best) {
+    best.hit = true;
+    combo++;
+    if (bestDelta < 0.05) {
+      score += 300 * combo;
+      showFeedback('PERFECT', '#f1c40f');
+      playClick(880, 0.04);
+    } else if (bestDelta < 0.1) {
+      score += 100 * combo;
+      showFeedback('GREAT', '#2ecc71');
+      playClick(660, 0.04);
+    } else {
+      score += 50 * combo;
+      showFeedback('GOOD', '#3498db');
+      playClick(440, 0.04);
+    }
+  } else {
+    playClick(220, 0.04);
+  }
+
+  updateUI();
+});
+
+// ─── UI HELPERS ───────────────────────────────────────────────────────────────
+function updateUI() {
+  document.getElementById('scoreDisplay').textContent = score;
+  document.getElementById('comboDisplay').textContent = combo;
+}
+
+function showFeedback(text, color) {
+  const el = document.getElementById('feedback');
+  el.textContent = text;
+  el.style.color = color;
+  clearTimeout(feedbackTimer);
+  feedbackTimer = setTimeout(() => { el.textContent = ''; }, 500);
+}
+
+// Initial blank draw
+ctx.fillStyle = '#1a1a1a';
+ctx.fillRect(0, 0, canvas.width, canvas.height);
+LANE_COLORS.forEach((color, i) => {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(i * LANE_WIDTH + 4, HIT_ZONE_Y - 18, LANE_WIDTH - 8, 20);
+});
+ctx.fillStyle = '#333';
+ctx.fillRect(0, HIT_ZONE_Y, canvas.width, 3);
+</script>
+</body>
+</html>
